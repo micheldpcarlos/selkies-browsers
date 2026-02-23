@@ -32,12 +32,113 @@ import os
 import subprocess
 import socket
 import time
+import ctypes
+import ctypes.util
 from PIL import Image
 from gamepad import SelkiesGamepad
 
 import logging
 logger = logging.getLogger("webrtc_input")
 logger.setLevel(logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# X11 cursor name via ctypes (XFixesGetCursorImageAndName, opcode 25)
+#
+# python-xlib's xfixes_get_cursor_image() returns pixel data but no cursor
+# name. The name is available via XFixesGetCursorImageAndName in libXfixes,
+# which we call directly via ctypes.
+# ---------------------------------------------------------------------------
+
+class _XFixesCursorImage(ctypes.Structure):
+    """XFixesCursorImage struct layout on x86_64 (includes name fields)."""
+    _fields_ = [
+        ("x", ctypes.c_short), ("y", ctypes.c_short),
+        ("width", ctypes.c_ushort), ("height", ctypes.c_ushort),
+        ("xhot", ctypes.c_ushort), ("yhot", ctypes.c_ushort),
+        ("cursor_serial", ctypes.c_ulong), ("pixels", ctypes.c_void_p),
+        ("atom", ctypes.c_ulong), ("name", ctypes.c_char_p),
+    ]
+
+_cn_display = None
+_cn_libs = None
+_cn_init_done = False
+
+def _init_cursor_name():
+    global _cn_display, _cn_libs, _cn_init_done
+    if _cn_init_done:
+        return _cn_display is not None
+    _cn_init_done = True
+    try:
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+        xfixes = ctypes.CDLL(ctypes.util.find_library("Xfixes"))
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XFree.argtypes = [ctypes.c_void_p]
+        x11.XFree.restype = ctypes.c_int
+        xfixes.XFixesQueryExtension.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+        xfixes.XFixesQueryExtension.restype = ctypes.c_int
+        xfixes.XFixesGetCursorImageAndName.argtypes = [ctypes.c_void_p]
+        xfixes.XFixesGetCursorImageAndName.restype = ctypes.POINTER(_XFixesCursorImage)
+        dpy = x11.XOpenDisplay(os.environ.get("DISPLAY", ":99").encode())
+        if not dpy:
+            return False
+        eb, er = ctypes.c_int(), ctypes.c_int()
+        if not xfixes.XFixesQueryExtension(dpy, ctypes.byref(eb), ctypes.byref(er)):
+            return False
+        _cn_display = dpy
+        _cn_libs = (x11, xfixes)
+        logger.info("cursor name support initialized (XFixesGetCursorImageAndName)")
+        return True
+    except Exception as e:
+        logger.warning("cursor name support unavailable: %s", e)
+        return False
+
+_X11_TO_CSS = {
+    "left_ptr": "default",
+    "arrow": "default",
+    "hand2": "pointer",
+    "hand1": "pointer",
+    "xterm": "text",
+    "fleur": "move",
+    "crosshair": "crosshair",
+    "watch": "wait",
+    "left_ptr_watch": "progress",
+    "question_arrow": "help",
+    "X_cursor": "not-allowed",
+    "pirate": "not-allowed",
+    "top_side": "n-resize",
+    "bottom_side": "s-resize",
+    "left_side": "w-resize",
+    "right_side": "e-resize",
+    "top_left_corner": "nw-resize",
+    "top_right_corner": "ne-resize",
+    "bottom_left_corner": "sw-resize",
+    "bottom_right_corner": "se-resize",
+    "sb_h_double_arrow": "ew-resize",
+    "sb_v_double_arrow": "ns-resize",
+    "grabbing": "grabbing",
+    "grab": "grab",
+}
+
+def _get_css_cursor():
+    """Return the current cursor as a CSS cursor value, or None."""
+    if not _init_cursor_name():
+        return None
+    try:
+        x11, xfixes = _cn_libs
+        result = xfixes.XFixesGetCursorImageAndName(_cn_display)
+        if not result:
+            return None
+        name = result.contents.name
+        x11_name = name.decode("utf-8", errors="replace") if name else None
+        x11.XFree(result)
+        if x11_name:
+            return _X11_TO_CSS.get(x11_name)
+        return None
+    except Exception:
+        return None
 
 # Local enumerations for mouse actions.
 MOUSE_POSITION = 10
@@ -519,7 +620,7 @@ class WebRTCInput:
         if sum(cursor.cursor_image) == 0:
             override = "none"
 
-        return {
+        msg = {
             "curdata": png_data_b64.decode(),
             "handle": cursor.cursor_serial,
             "override": override,
@@ -528,6 +629,10 @@ class WebRTCInput:
                 "y": yhot_scaled,
             },
         }
+        css_cursor = _get_css_cursor()
+        if css_cursor:
+            msg["css_cursor"] = css_cursor
+        return msg
 
     def cursor_to_png(self, cursor, resize_width, resize_height):
         with io.BytesIO() as f:
